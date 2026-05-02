@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
   pull-requests: write
   # The Anthropic claude-code-action @v1 uses GitHub OIDC to mint a
   # short-lived GITHUB_TOKEN for posting review comments back. Without
