@@ -24,15 +24,11 @@ on:
 
 permissions:
   contents: read
-  id-token: write
   issues: write
   pull-requests: write
-  # The Anthropic claude-code-action @v1 uses GitHub OIDC to mint a
-  # short-lived GITHUB_TOKEN for posting review comments back. Without
-  # id-token: write here AND in every consuming stub, the action errors
-  # with "Could not fetch an OIDC token". This is required even when
-  # using OAuth-via-CLAUDE_CODE_OAUTH_TOKEN auth — OAuth covers Anthropic
-  # API access; id-token covers the GitHub-side write path.
+  # We pass `github_token` to the claude-code-action to avoid its default
+  # GitHub App OIDC token-exchange flow, which requires default-branch
+  # workflow parity and breaks PRs that modify workflow files.
 
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
@@ -66,6 +62,9 @@ jobs:
           # If Max quota exhausted, swap consumers to API key:
           # `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Avoid the action's GitHub App OIDC token exchange, which fails on PRs
+          # that modify workflow files (requires default-branch workflow parity).
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           track_progress: false
           prompt: |
             REPO: ${{ github.repository }}
