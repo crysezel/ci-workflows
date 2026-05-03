@@ -53,7 +53,8 @@ jobs:
           fetch-depth: 1
 
       - name: Claude adversarial review
-        uses: anthropics/claude-code-action@v1
+        # v1.0.111, pinned for repos that enforce SHA-pinned actions.
+        uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
         with:
           # OAuth token uses the Max plan quota instead of API billing.
           # To rotate: `claude setup-token` locally, then
