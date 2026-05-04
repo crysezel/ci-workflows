@@ -46,6 +46,44 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Verify OAuth token (OAuth-only — no API-key fallback)
+        env:
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$OAUTH" ]; then
+            echo "::error title=Missing OAuth token::CLAUDE_CODE_OAUTH_TOKEN is not set on this repo. Run 'claude setup-token' locally, then 'gh secret set CLAUDE_CODE_OAUTH_TOKEN -R crysezel/<repo> --body \"\$TOKEN\"'."
+            exit 1
+          fi
+          if [[ "$OAUTH" =~ ^sk-ant-api ]]; then
+            echo "::error title=API key not allowed::CLAUDE_CODE_OAUTH_TOKEN looks like an API key (sk-ant-api...). This workflow is OAuth-only. Run 'claude setup-token' to mint an OAuth token (sk-ant-oat...)."
+            exit 1
+          fi
+          if [[ ! "$OAUTH" =~ ^sk-ant-oat ]]; then
+            echo "::error title=Unrecognised token format::CLAUDE_CODE_OAUTH_TOKEN does not start with the OAuth prefix (sk-ant-oat). Run 'claude setup-token' to mint a valid OAuth token."
+            exit 1
+          fi
+          status=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 \
+            -X POST https://api.anthropic.com/v1/messages \
+            -H "Authorization: Bearer $OAUTH" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' || echo "000")
+          case "$status" in
+            200|400)
+              echo "OAuth token accepted by Anthropic (HTTP $status)."
+              ;;
+            401|403)
+              echo "::error title=OAuth token rejected::Anthropic returned HTTP $status. Token expired or revoked. Run 'claude setup-token' locally, then propagate the new token to all consuming repos: for r in solas-dashboard renters-support-hub clarity-os work-connector pinkhomeless milo-memory magic-mark-hub curorhomeless CPAI_Homeless_Lovable_Cloud_AI consensus-smoke-test assisted-clarity-system; do gh secret set CLAUDE_CODE_OAUTH_TOKEN -R \"crysezel/\$r\" --body \"\$NEW_OAUTH\"; done"
+              exit 1
+              ;;
+            000)
+              echo "::warning title=Anthropic auth precheck unreachable::Could not contact api.anthropic.com to validate OAuth token. Continuing — the main action will surface auth failures if any."
+              ;;
+            *)
+              echo "::warning title=Unexpected auth precheck status::Anthropic returned HTTP $status. Continuing."
+              ;;
+          esac
+
       - name: Checkout PR merge ref
         # SHA-pinned. v6 = de0fac2.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -56,12 +94,10 @@ jobs:
         # v1.0.111, pinned for repos that enforce SHA-pinned actions.
         uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
         with:
-          # OAuth token uses the Max plan quota instead of API billing.
-          # To rotate: `claude setup-token` locally, then
+          # OAuth-only. To rotate: `claude setup-token` locally, then
           # `gh secret set CLAUDE_CODE_OAUTH_TOKEN -R crysezel/<repo> --body "$TOKEN"`
-          # in each consuming repo.
-          # If Max quota exhausted, swap consumers to API key:
-          # `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`
+          # on every consuming repo. API-key authentication is not
+          # supported in this workflow — see the precheck step above.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Avoid the action's GitHub App OIDC token exchange, which fails on PRs
           # that modify workflow files (requires default-branch workflow parity).
