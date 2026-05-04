@@ -96,9 +96,21 @@ jobs:
         with:
           # OAuth-only. To rotate: `claude setup-token` locally, then
           # `gh secret set CLAUDE_CODE_OAUTH_TOKEN -R crysezel/<repo> --body "$TOKEN"`
-          # on every consuming repo. API-key authentication is not
-          # supported in this workflow — see the precheck step above.
+          # on every consuming repo, AND the same with `--app dependabot`
+          # so Dependabot-triggered runs can read the secret too. API-key
+          # authentication is not supported in this workflow — see the
+          # precheck step above.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Allow Dependabot-triggered runs through the action's bot guard.
+          # The reusable workflow's intent (per the file header) is that
+          # dependency-bump PRs SHOULD be reviewed adversarially — supply
+          # chain attacks land in version bumps. Without this input the
+          # action fails fast with "Workflow initiated by non-human actor".
+          # Note: requires CLAUDE_CODE_OAUTH_TOKEN to ALSO be set as a
+          # Dependabot secret (`gh secret set ... --app dependabot ...`)
+          # because GitHub does not pass Actions secrets to Dependabot
+          # PRs by default.
+          allowed_bots: "dependabot[bot]"
           # Avoid the action's GitHub App OIDC token exchange, which fails on PRs
           # that modify workflow files (requires default-branch workflow parity).
           github_token: ${{ secrets.GITHUB_TOKEN }}
