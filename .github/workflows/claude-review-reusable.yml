@@ -51,7 +51,7 @@ jobs:
           OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           if [ -z "$OAUTH" ]; then
-            echo "::error title=Missing OAuth token::CLAUDE_CODE_OAUTH_TOKEN is not set on this repo. Run 'claude setup-token' locally, then 'gh secret set CLAUDE_CODE_OAUTH_TOKEN -R crysezel/<repo> --body \"\$TOKEN\"'."
+            echo "::error title=Missing OAuth token::CLAUDE_CODE_OAUTH_TOKEN is not set on this repo. Run 'claude setup-token' locally, then 'gh secret set CLAUDE_CODE_OAUTH_TOKEN -R crysezel/<repo> --body \"$TOKEN\"'."
             exit 1
           fi
           if [[ "$OAUTH" =~ ^sk-ant-api ]]; then
@@ -66,6 +66,7 @@ jobs:
             -X POST https://api.anthropic.com/v1/messages \
             -H "Authorization: Bearer $OAUTH" \
             -H "anthropic-version: 2023-06-01" \
+            -H "anthropic-beta: oauth-2023-09-01" \
             -H "content-type: application/json" \
             -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' || echo "000")
           case "$status" in
