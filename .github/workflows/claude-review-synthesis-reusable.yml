@@ -1,0 +1,270 @@
+name: Claude Review Synthesis (reusable)
+
+# Reusable workflow. Synthesises findings from multiple PR reviewers
+# (Claude adversarial review, Codex, CodeRabbit, Cursor Bugbot, Copilot,
+# any other bot reviewer) into ONE consolidated comment that:
+#
+#   - Corroborated: multiple reviewers agree → high-confidence keep
+#   - Disputed:    one flagged it, another disagreed → escalate to human
+#   - Discounted:  likely false positive with stated reason
+#
+# Architecture: the synthesis runs AFTER the primary "Claude Adversarial
+# PR Review" workflow completes (workflow_run trigger in the consuming
+# repo's stub). By that time the faster bots (CodeRabbit ~1min,
+# Bugbot ~30s, Copilot ~30s) have usually posted too.
+#
+# Consuming-repo stub example:
+#
+#   on:
+#     workflow_run:
+#       workflows: ["Claude Adversarial PR Review"]
+#       types: [completed]
+#
+#   jobs:
+#     synthesis:
+#       if: >
+#         github.event.workflow_run.event == 'pull_request' &&
+#         github.event.workflow_run.conclusion != 'cancelled'
+#       uses: crysezel/ci-workflows/.github/workflows/claude-review-synthesis-reusable.yml@<sha>
+#       secrets:
+#         CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+on:
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+# Concurrency keyed on the originating PR number (looked up from the
+# triggering workflow run). cancel-in-progress so a fresh push supersedes
+# stale synthesis runs and we don't burn tokens on a superseded diff.
+concurrency:
+  group: claude-synthesis-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  synthesis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Verify OAuth token format (OAuth-only — no API-key fallback)
+        # Same format-only check as the primary review reusable. Liveness
+        # is left to claude-code-action.
+        env:
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          ROTATE_HINT="Run 'claude setup-token' locally, then for each repo set BOTH the Actions secret AND the Dependabot secret: gh secret set CLAUDE_CODE_OAUTH_TOKEN -R crysezel/<repo> --body \"\$TOKEN\" && gh secret set CLAUDE_CODE_OAUTH_TOKEN --app dependabot -R crysezel/<repo> --body \"\$TOKEN\"."
+          if [ -z "$OAUTH" ]; then
+            echo "::error title=Missing OAuth token::CLAUDE_CODE_OAUTH_TOKEN is not set on this repo. $ROTATE_HINT"
+            exit 1
+          fi
+          if [[ "$OAUTH" =~ ^sk-ant-api ]]; then
+            echo "::error title=API key not allowed::CLAUDE_CODE_OAUTH_TOKEN looks like an API key. This workflow is OAuth-only. $ROTATE_HINT"
+            exit 1
+          fi
+          if [[ ! "$OAUTH" =~ ^sk-ant-oat ]]; then
+            echo "::error title=Unrecognised token format::CLAUDE_CODE_OAUTH_TOKEN does not start with the OAuth prefix (sk-ant-oat). $ROTATE_HINT"
+            exit 1
+          fi
+          echo "OAuth token format OK."
+
+      - name: Resolve PR number from triggering workflow run
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # workflow_run events carry head_sha but not always the PR number
+          # directly. Resolve via the search API.
+          PR=$(gh api -X GET search/issues \
+            -f q="repo:${{ github.repository }} type:pr is:open ${HEAD_SHA}" \
+            --jq '.items[0].number' 2>/dev/null || echo "")
+          if [ -z "$PR" ] || [ "$PR" = "null" ]; then
+            echo "::warning::No open PR found for head SHA ${HEAD_SHA}. Synthesis will exit cleanly."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Resolved PR number: $PR"
+            echo "number=$PR" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout PR head with full history
+        if: steps.pr.outputs.skip == 'false'
+        # SHA-pinned. v6 = de0fac2.
+        # fetch-depth: 0 so Claude can verify findings via `git show`.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Collect reviewer data
+        if: steps.pr.outputs.skip == 'false'
+        id: collect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          DATA=$(
+            {
+              echo "## Review summaries (top of each review)"
+              echo
+              gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+                --jq '.[] | select(.body != null and .body != "") | "**\(.user.login) (\(.state)) at \(.submitted_at)**\n\n\(.body[:2000])\n\n---\n"' \
+                || echo "(no review summaries available)"
+              echo
+              echo "## Inline review comments (line-level findings)"
+              echo
+              gh api "repos/$REPO/pulls/$PR_NUMBER/comments" --paginate \
+                --jq '.[] | "**\(.user.login) on `\(.path)`\(if .line then ":" + (.line | tostring) else "" end)**\n\n\(.body[:1500])\n\n---\n"' \
+                || echo "(no inline comments available)"
+              echo
+              echo "## Top-level PR comments (bot summaries — Claude adversarial review, Codex, etc.)"
+              echo
+              gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+                --jq '[.[] | select(.user.type == "Bot" or (.user.login | test("\\[bot\\]$|claude|codex|coderabbit|cursor|copilot"; "i")))] | .[] | "**\(.user.login) at \(.created_at)**\n\n\(.body[:2000])\n\n---\n"' \
+                || echo "(no bot comments available)"
+            } 2>&1
+          )
+          # Truncate to 200KB to stay within Claude's prompt budget on busy PRs
+          DATA=$(echo "$DATA" | head -c 200000)
+
+          # Multiline output via heredoc per Actions docs
+          {
+            echo "data<<__SYNTHESIS_EOF__"
+            echo "$DATA"
+            echo "__SYNTHESIS_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          # Reviewer count for an upfront tally
+          REVIEWERS=$(echo "$DATA" | grep -oE '\*\*[a-zA-Z0-9_\[\]-]+ ' | sort -u | wc -l)
+          echo "reviewer_count=$REVIEWERS" >> "$GITHUB_OUTPUT"
+          echo "Collected reviewer data ($(echo "$DATA" | wc -c) bytes, $REVIEWERS unique authors)"
+
+      - name: Claude synthesis review
+        if: steps.pr.outputs.skip == 'false'
+        # v1.0.111, pinned for repos that enforce SHA-pinned actions.
+        uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "dependabot[bot],renovate[bot]"
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          track_progress: false
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ steps.pr.outputs.number }}
+            HEAD SHA: ${{ github.event.workflow_run.head_sha }}
+            UNIQUE REVIEWER AUTHORS DETECTED: ${{ steps.collect.outputs.reviewer_count }}
+
+            You are the SYNTHESIS pass. Multiple PR reviewers (Claude
+            adversarial review, Codex, CodeRabbit, Cursor Bugbot, GitHub
+            Copilot, and any other configured bots) have already posted.
+            Your job is to CROSS-CHECK their findings, not to introduce
+            new ones.
+
+            Hard rules:
+            - Do NOT invent new findings. If a finding isn't already in
+              the input data below, you cannot add it.
+            - Do NOT modify any source file. Do NOT push commits.
+            - Do NOT submit a GitHub Review with state APPROVE or
+              REQUEST_CHANGES — post comments only.
+            - Do NOT auto-merge.
+            - Output exactly ONE top-level PR comment via
+              `gh pr comment ${{ steps.pr.outputs.number }} ...`.
+            - The comment MUST start with the literal heading:
+              `## Reviewer Synthesis`
+
+            What to do:
+
+            1. Read the input data below carefully. It contains every
+               review summary, inline comment, and bot top-level comment
+               that has been posted on this PR.
+
+            2. Group findings by their underlying issue. Two reviewers
+               flagging the same file:line with the same root cause is
+               ONE corroborated finding, not two. Use file path + line
+               number + topic as the de-duplication key.
+
+            3. Classify each grouped finding into one of:
+               - **Corroborated**: 2+ independent reviewers flagged it.
+                 High confidence. Author should fix.
+               - **Disputed**: One reviewer flagged it; another reviewer
+                 either explicitly disagreed OR reviewed the same area
+                 and did not raise the same concern despite likely seeing
+                 it. Escalate to human author for arbitration.
+               - **Discounted**: A finding that you have HIGH confidence
+                 is a false positive based on the actual code in the diff.
+                 You may verify by reading the changed files via:
+                   git show ${{ github.event.workflow_run.head_sha }}:<path>
+                   git diff ${{ github.event.workflow_run.head_sha }}^!
+                 Provide a one-line reason for discounting.
+
+            4. If a finding is corroborated by Claude adversarial review's
+               P0 severity AND any other reviewer, escalate it to the top
+               of the Corroborated list — that's the highest-signal class.
+
+            5. Respect the original severity tags where available
+               (P0/P1/P2/P3 from Claude adversarial). Do not invent new
+               severities for findings that didn't have them.
+
+            Allowed verification tools:
+              - `git show <sha>:<path>` — read file content at a SHA
+              - `git diff <ranges>` — verify diff content
+              - `gh pr diff ${{ steps.pr.outputs.number }}` — unified diff
+
+            You may NOT call `gh api` to fetch additional reviewer data.
+            All reviewer input is below in the INPUT section.
+
+            Output format (single PR comment):
+
+            ```
+            ## Reviewer Synthesis
+
+            **Tally:** corroborated=N, disputed=M, discounted=K  (across <reviewer_count> reviewers)
+
+            ### Corroborated (high-confidence, fix before merge)
+            <ordered by severity, P0 first>
+            - **<file>:<line>** — <one-line summary>
+              - Cited by: <reviewer A (severity)>, <reviewer B>
+              - Synthesis: <one-line agreement reasoning>
+
+            ### Disputed (escalate to author)
+            - **<file>:<line>** — <one-line summary>
+              - Flagged by: <reviewer A>
+              - Pushback: <reviewer B disagreed because Z> OR <other reviewers reviewed this area and did not flag>
+              - Recommendation: <which side you lean and why, in ≤2 sentences>
+
+            ### Discounted (likely false positive)
+            - **<file>:<line>** — <one-line summary>
+              - Flagged by: <reviewer A>
+              - Reason for discounting: <one-line, grounded in the actual code>
+
+            ### Notes (optional, ≤3 bullets)
+            - <any meta observation, e.g. "CodeRabbit reviewed an older commit">
+            ```
+
+            If there are zero findings to synthesise (all reviewers
+            posted clean reviews or only walkthroughs), post exactly:
+
+            `## Reviewer Synthesis\n\nNo blocking findings to synthesise. All reviewers concluded cleanly.`
+
+            ## INPUT — reviewer data collected at synthesis start
+
+            ${{ steps.collect.outputs.data }}
+
+          claude_args: |
+            --model claude-opus-4-7
+            --max-turns 12
+            # No `gh api` in allowedTools — reviewer data is inlined above.
+            # No `gh pr view` — PR metadata is in the prompt template.
+            # git tools enable verification of disputed/discounted findings
+            # against the actual code at HEAD SHA. gh pr comment is the
+            # single write tool: one synthesis comment per run.
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(git show:*),Bash(git diff:*),Bash(git ls-tree:*)"
