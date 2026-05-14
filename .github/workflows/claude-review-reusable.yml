@@ -47,7 +47,7 @@ jobs:
     # timeout-minutes scales roughly as max-turns * 60s on Opus 4.7 with
     # base-branch doc fetches. Keep `timeout-minutes >= max-turns` to give
     # the action room to finish within budget.
-    timeout-minutes: 25
+    timeout-minutes: 45
 
     steps:
       - name: Verify OAuth token format (OAuth-only — no API-key fallback)
@@ -205,7 +205,7 @@ jobs:
             issues to look useful.
           claude_args: |
             --model claude-opus-4-7
-            --max-turns 25
+            --max-turns 40
             # allowedTools is the minimum the scripted prompt steps need:
             #   - inline_comment + gh pr comment: post findings
             #   - gh pr diff: read the unified PR diff
