@@ -47,7 +47,7 @@ jobs:
     # Sonnet is the default hosted reviewer model because Opus burns the
     # monthly Claude Code pool too quickly when Dependabot opens batches.
     # Keep `timeout-minutes >= max-turns` to give the action room to finish.
-    timeout-minutes: 60
+    timeout-minutes: 75
 
     steps:
       - name: Verify OAuth token format (OAuth-only — no API-key fallback)
