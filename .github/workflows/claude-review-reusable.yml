@@ -26,10 +26,10 @@ on:
         type: string
         default: claude-sonnet-4-6
       max_turns:
-        description: "Maximum Claude Code turns for the hosted reviewer."
+        description: "Maximum Claude Code turns for the hosted reviewer; must be <= 75."
         required: false
-        type: string
-        default: "60"
+        type: number
+        default: 60
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
@@ -91,6 +91,13 @@ jobs:
             exit 1
           fi
           echo "OAuth token format OK (sk-ant-oat prefix confirmed)."
+
+      - name: Validate review budget
+        run: |
+          if [ "${{ inputs.max_turns }}" -gt 75 ]; then
+            echo "::error title=Invalid max_turns::max_turns must be <= 75 to stay within the 75-minute job timeout."
+            exit 1
+          fi
 
       - name: Checkout PR merge ref with full history
         # SHA-pinned. v6 = de0fac2.
