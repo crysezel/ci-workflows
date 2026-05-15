@@ -111,6 +111,8 @@ jobs:
           fetch-depth: 0
 
       - name: Claude adversarial review
+        id: claude_review
+        continue-on-error: true
         # v1.0.111, pinned for repos that enforce SHA-pinned actions.
         uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
         with:
@@ -237,3 +239,14 @@ jobs:
             #   - git log / git blame (history context not in scripted path;
             #     re-add only if a future review demonstrably needs them)
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(git show:*),Bash(git ls-tree:*),Bash(git diff:*)"
+
+      - name: Record advisory Claude tool failure
+        if: ${{ steps.claude_review.outcome == 'failure' }}
+        run: |
+          {
+            echo "## Claude advisory review unavailable"
+            echo ""
+            echo "The hosted Claude reviewer is advisory. Its action step failed, so this job is preserving repo progress while required CI, local validation, and PR review-thread gates remain authoritative."
+            echo ""
+            echo "Inspect the action log for the exact hosted-tool error before relying on hosted Claude output for this PR."
+          } >> "$GITHUB_STEP_SUMMARY"
