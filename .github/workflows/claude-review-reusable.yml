@@ -19,6 +19,17 @@ name: Claude Adversarial PR Review (reusable)
 
 on:
   workflow_call:
+    inputs:
+      claude_model:
+        description: "Claude model to use for hosted PR review."
+        required: false
+        type: string
+        default: claude-sonnet-4-6
+      max_turns:
+        description: "Maximum Claude Code turns for the hosted reviewer."
+        required: false
+        type: string
+        default: "60"
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
@@ -204,8 +215,8 @@ jobs:
             surrounding code, or the BASE-BRANCH rulebook. Do not invent
             issues to look useful.
           claude_args: |
-            --model claude-sonnet-4-6
-            --max-turns 60
+            --model ${{ inputs.claude_model }}
+            --max-turns ${{ inputs.max_turns }}
             # allowedTools is the minimum the scripted prompt steps need:
             #   - inline_comment + gh pr comment: post findings
             #   - gh pr diff: read the unified PR diff
