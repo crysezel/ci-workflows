@@ -70,9 +70,10 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: read
-  pull-requests: read
+# NOTE: no top-level `permissions:` here on purpose. Consuming repos have
+# default_workflow_permissions=read, and a called workflow that declares its
+# own permissions block fails the run at startup (startup_failure, no jobs,
+# no annotation). The CALLER grants permissions on the job that `uses:` this.
 
 jobs:
   review-gate:
@@ -99,6 +100,11 @@ jobs:
             body = os.environ.get("PR_BODY") or ""
             head = os.environ["HEAD_SHA"]
             policy_doc = os.environ.get("POLICY_DOC") or "the policy doc"
+
+            # Strip fenced code blocks first. A PR that documents the receipt
+            # format would otherwise have its EXAMPLE parsed as a real receipt
+            # - which is exactly what happened on the first live run.
+            body = re.sub(r"```.*?```", "", body, flags=re.S)
 
             # Optional repo prefix keeps pre-existing markers working, e.g.
             # `solas-review-gate` from before this was centralised.
