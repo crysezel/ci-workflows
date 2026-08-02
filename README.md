@@ -53,6 +53,13 @@ on:
 
 jobs:
   review-gate:
+    # REQUIRED. These repos have default_workflow_permissions=read, and a called
+    # workflow that declares its own top-level `permissions:` fails the run at
+    # startup (startup_failure, no jobs, no annotation). The caller must grant
+    # them here instead.
+    permissions:
+      contents: read
+      pull-requests: read
     uses: crysezel/ci-workflows/.github/workflows/review-gate-reusable.yml@main
     with:
       policy_doc: "docs/review-gate.md"
@@ -61,7 +68,7 @@ jobs:
         ^supabase/(migrations|functions)/
 ```
 
-Then every PR must carry a receipt in its description:
+Put the receipt in the PR description as a raw HTML comment, **not** inside a code fence - fenced blocks are stripped so documentation examples are not mistaken for real receipts:
 
 ```
 <!-- review-gate
