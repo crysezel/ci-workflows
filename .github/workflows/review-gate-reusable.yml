@@ -1,0 +1,274 @@
+name: Review Gate (reusable)
+
+# Enforces that adversarial review actually happened against the CURRENT PR
+# head before merge is unblocked. Consumed via `workflow_call` from a ~12-line
+# stub in each repo. See README.md for the stub and per-repo tuning.
+#
+# Two-part check:
+#   1. The PR description carries exactly one `review-gate` receipt whose
+#      head_sha matches the current head. Stale receipts fail on purpose, so a
+#      fix-loop push forces re-review.
+#   2. The claimed status is corroborated by a GitHub artifact the PR author
+#      cannot fake by editing the description:
+#        - CLEAN    -> a Codex review whose commit_id is this head SHA, with no
+#                      UNRESOLVED blocking threads. A review existing is not the
+#                      same as a review being clean.
+#        - OVERRIDE -> a comment from an allowlisted user naming this head SHA.
+#
+# P0/P1 always block. P2 blocks only when the diff touches `sensitive_paths`,
+# so a style nit cannot hold up a routine change. Sensitivity is derived from
+# the diff, never self-declared.
+#
+# Ceiling, stated plainly: in a repo where one account is author, approver and
+# thread-resolver, no check that account controls can bind it. This makes a
+# bypass explicit, deliberate and auditable - not impossible. Treat it as a
+# discipline aid, not a security boundary.
+#
+# To change behaviour for ALL consuming repos: edit this file, then bump the
+# pinned SHA/tag in each stub (or leave stubs on @main for continuous delivery).
+
+on:
+  workflow_call:
+    inputs:
+      sensitive_paths:
+        description: >
+          Newline-separated POSIX ERE patterns matched against changed file
+          paths (case-insensitive). A match puts the PR in the strict lane
+          where P2 findings also block. Tune per repo; over-matching fails
+          toward strict, which is the safe direction.
+        required: false
+        type: string
+        default: |
+          ^\.github/
+          ^(AGENTS|CLAUDE|REVIEW)\.md$
+          ^supabase/(migrations|functions)/
+          [^/]*(auth|rls|security|secret|credential)[^/]*\.(ts|tsx|js|sql|json|ya?ml|toml)$
+      allowed_approvers:
+        description: >
+          Comma-separated GitHub logins permitted to authorize an OVERRIDE by
+          commenting `review-gate-override <head_sha>` on the PR.
+        required: false
+        type: string
+        default: crysezel
+      policy_doc:
+        description: "Where the receipt format is documented, cited in error messages."
+        required: false
+        type: string
+        default: "the repo's review-gate policy doc"
+      codex_bot_login:
+        description: "Login prefix of the Codex review bot (REST appends [bot], GraphQL does not)."
+        required: false
+        type: string
+        default: chatgpt-codex-connector
+      codex_required:
+        description: >
+          When true, a CLEAN receipt requires a real Codex review of the current
+          head. Set false ONLY for repos where Codex review is not enabled yet -
+          CLEAN then rests on the receipt alone, which is self-attested and
+          proves nothing. The run warns loudly when this is false.
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review-gate:
+    name: Review Gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse review receipt
+        id: receipt
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          POLICY_DOC: ${{ inputs.policy_doc }}
+          # Held in an env var rather than a heredoc: Semgrep parses `run:`
+          # blocks as Bash and chokes on `python3 <<'PY'`, which fails the
+          # required Semgrep check in consuming repos.
+          PARSER: |
+            import os, re, sys
+
+            def fail(msg):
+                print(f"::error::{msg}")
+                sys.exit(1)
+
+            body = os.environ.get("PR_BODY") or ""
+            head = os.environ["HEAD_SHA"]
+            policy_doc = os.environ.get("POLICY_DOC") or "the policy doc"
+
+            # Optional repo prefix keeps pre-existing markers working, e.g.
+            # `solas-review-gate` from before this was centralised.
+            blocks = re.findall(r"<!--\s*(?:[A-Za-z0-9]+-)?review-gate\b(.*?)-->", body, re.S)
+            if not blocks:
+                fail(f"No review-gate receipt found in the PR description. See {policy_doc}.")
+            if len(blocks) > 1:
+                fail(f"Found {len(blocks)} review-gate receipt blocks; keep exactly one so the gate cannot read a stale receipt.")
+
+            fields = {}
+            for line in blocks[0].splitlines():
+                m = re.match(r"\s*([A-Za-z_]+)\s*:\s*(.*?)\s*$", line)
+                if m:
+                    fields[m.group(1).lower()] = m.group(2).strip()
+
+            status = fields.get("status", "")
+            if not status:
+                fail("Receipt is missing a 'status:' field (expected CLEAN or OVERRIDE).")
+            if status not in ("CLEAN", "OVERRIDE"):
+                fail(f"Receipt status must be CLEAN or OVERRIDE, got: '{status}'")
+
+            sha = fields.get("head_sha", "")
+            if not sha:
+                fail(f"Receipt is missing a 'head_sha:' field. Current PR head is {head}.")
+            if sha != head:
+                fail(f"Receipt head_sha ({sha}) does not match current PR head ({head}). The receipt is stale - re-review after the latest push and update it.")
+
+            if status == "CLEAN":
+                if not fields.get("verdict"):
+                    fail("A CLEAN receipt requires a non-empty 'verdict:' field.")
+            else:
+                if not fields.get("reason"):
+                    fail("An OVERRIDE receipt requires a non-empty 'reason:' field.")
+                if not fields.get("approved_by"):
+                    fail("An OVERRIDE receipt requires a non-empty 'approved_by:' field naming the authorizing user (never the agent/session).")
+
+            approved_by = re.sub(r"[^A-Za-z0-9_-]", "", fields.get("approved_by", ""))[:64]
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write(f"status={status}\n")
+                fh.write(f"approved_by={approved_by}\n")
+            print(f"Receipt parsed: status={status} at {head}")
+        run: python3 -c "$PARSER"
+
+      - name: Classify change sensitivity
+        id: risk
+        if: ${{ steps.receipt.outputs.status == 'CLEAN' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SENSITIVE_PATHS: ${{ inputs.sensitive_paths }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > changed.txt
+          printf '%s\n' "$SENSITIVE_PATHS" | grep -v '^[[:space:]]*$' > patterns.txt || true
+
+          if [ ! -s patterns.txt ]; then
+            echo "badges=P0 Badge|P1 Badge" >> "$GITHUB_OUTPUT"
+            echo "No sensitive_paths configured - only P0/P1 are blocking."
+            exit 0
+          fi
+
+          sensitive="$(grep -Eif patterns.txt changed.txt || true)"
+          if [ -n "$sensitive" ]; then
+            echo "badges=P0 Badge|P1 Badge|P2 Badge" >> "$GITHUB_OUTPUT"
+            echo "Sensitive paths changed - P0/P1/P2 are all blocking:"
+            printf '%s\n' "$sensitive"
+          else
+            echo "badges=P0 Badge|P1 Badge" >> "$GITHUB_OUTPUT"
+            echo "Routine change - only P0/P1 are blocking; P2/P3 are advisory."
+          fi
+
+      - name: Warn when Codex corroboration is disabled
+        if: ${{ steps.receipt.outputs.status == 'CLEAN' && !inputs.codex_required }}
+        run: |
+          echo "::warning::codex_required is false for this repo, so a CLEAN receipt is self-attested and is NOT evidence that review happened. Enable Codex review here and set codex_required: true."
+
+      - name: Verify Codex reviewed this head and left no blocking findings
+        if: ${{ steps.receipt.outputs.status == 'CLEAN' && inputs.codex_required }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BLOCKING_BADGES: ${{ steps.risk.outputs.badges }}
+          BOT: ${{ inputs.codex_bot_login }}
+        run: |
+          set -euo pipefail
+          reviewed="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+            --jq ".[] | select(.user.login | startswith(\"${BOT}\")) | .commit_id" || true)"
+
+          if ! printf '%s\n' "$reviewed" | grep -qx "$HEAD_SHA"; then
+            if [ -z "$reviewed" ]; then reviewed="none"; fi
+            echo "::error::A CLEAN receipt requires a Codex review of the current head (${HEAD_SHA}), but none was found. Codex reviews asynchronously - wait for it to post, then re-run this check. If Codex is genuinely unavailable, use an OVERRIDE receipt."
+            echo "Codex review commits seen on this PR: $reviewed"
+            exit 1
+          fi
+
+          # --paginate + $endCursor/pageInfo walks EVERY page: a blocker past the
+          # first 100 threads would otherwise be invisible. Only UNRESOLVED
+          # threads count, so a dismissed false positive does not wedge the gate.
+          # Deliberately not `|| true` - an API failure must fail the gate, not
+          # read as "no blockers".
+          open_threads="$(gh api graphql --paginate \
+            -f owner="${REPO%/*}" -f name="${REPO#*/}" -F pr="${PR_NUMBER}" \
+            -f query='
+              query($owner:String!, $name:String!, $pr:Int!, $endCursor:String) {
+                repository(owner:$owner, name:$name) {
+                  pullRequest(number:$pr) {
+                    reviewThreads(first:100, after:$endCursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        isResolved
+                        comments(first:1) {
+                          nodes { author { login } body url commit { oid } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }' \
+            --jq "[.data.repository.pullRequest.reviewThreads.nodes[]
+                   | select(.isResolved | not)
+                   | .comments.nodes[0]
+                   | select(.author.login | startswith(\"${BOT}\"))
+                   | select(.commit.oid == \"${HEAD_SHA}\")
+                   | select(.body | test(\"${BLOCKING_BADGES}\"))
+                   | .url] | .[]")"
+
+          if [ -n "$open_threads" ]; then
+            count="$(printf '%s\n' "$open_threads" | grep -c . || true)"
+            echo "::error::Codex has ${count} unresolved blocking thread(s) (${BLOCKING_BADGES}) against ${HEAD_SHA}. Fix them and push, or resolve each thread with recorded rationale. A CLEAN receipt cannot be issued while they are open."
+            printf '%s\n' "$open_threads"
+            exit 1
+          fi
+
+          echo "Codex reviewed ${HEAD_SHA} with no unresolved blocking threads (${BLOCKING_BADGES})."
+
+      - name: Verify OVERRIDE was authorized by an allowlisted user
+        if: ${{ steps.receipt.outputs.status == 'OVERRIDE' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RECEIPT_APPROVER: ${{ steps.receipt.outputs.approved_by }}
+          ALLOWED_APPROVERS: ${{ inputs.allowed_approvers }}
+        run: |
+          set -euo pipefail
+          # The PR body is author-editable, so an OVERRIDE receipt alone proves
+          # nothing. Require a separate, identity-bearing comment naming this
+          # exact head SHA - AND require the receipt's approved_by to name that
+          # same account, so the durable receipt cannot misattribute authority.
+          approvers="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq ".[] | select(.body | test(\"review-gate-override[[:space:]]+${HEAD_SHA}\")) | .user.login" || true)"
+
+          for login in $(printf '%s\n' "$approvers" | sort -u); do
+            for allowed in $(printf '%s' "$ALLOWED_APPROVERS" | tr ',' ' '); do
+              if [ "$login" = "$allowed" ]; then
+                if [ "$login" != "$RECEIPT_APPROVER" ]; then
+                  echo "::error::Receipt approved_by is '${RECEIPT_APPROVER}' but the override comment was posted by '${login}'. The receipt must name the account that actually authorized the bypass."
+                  exit 1
+                fi
+                echo "::warning::Merging under a review-gate OVERRIDE authorized by ${login} - Codex review did not run for ${HEAD_SHA}."
+                exit 0
+              fi
+            done
+          done
+
+          if [ -z "$approvers" ]; then approvers="none"; fi
+          echo "::error::OVERRIDE requires a comment on this PR from an allowlisted user (${ALLOWED_APPROVERS}) containing: review-gate-override ${HEAD_SHA}"
+          echo "Comment authors matching that pattern: $approvers"
+          exit 1

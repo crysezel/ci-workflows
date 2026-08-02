@@ -7,6 +7,7 @@ Centralized GitHub Actions reusable workflows for repos owned by `crysezel`.
 | File | Purpose |
 |---|---|
 | `.github/workflows/claude-review-reusable.yml` | Adversarial Claude PR review — called via `workflow_call` from consuming repos |
+| `.github/workflows/review-gate-reusable.yml` | Merge gate: proves Codex review actually happened, and was clean, against the current head |
 | `templates/REVIEW.md` | Generic adversarial-review rulebook to copy into a consuming repo's root |
 
 ## How a consuming repo opts in
@@ -37,6 +38,81 @@ Centralized GitHub Actions reusable workflows for repos owned by `crysezel`.
    ```
 
 4. Open a draft PR with the stub + REVIEW.md. After merge, every PR gets reviewed.
+
+## Review Gate — how a consuming repo opts in
+
+Add this stub at `.github/workflows/review-gate.yml`:
+
+```yaml
+name: Review Gate
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, edited]
+    branches: [main]
+
+jobs:
+  review-gate:
+    uses: crysezel/ci-workflows/.github/workflows/review-gate-reusable.yml@main
+    with:
+      policy_doc: "docs/review-gate.md"
+      sensitive_paths: |
+        ^\.github/
+        ^supabase/(migrations|functions)/
+```
+
+Then every PR must carry a receipt in its description:
+
+```
+<!-- review-gate
+status: CLEAN
+head_sha: <current PR head SHA>
+verdict: <one line, e.g. "no blockers after 2 fix rounds">
+-->
+```
+
+`CLEAN` is only accepted when Codex has actually reviewed **that exact head SHA**
+and has **no unresolved blocking threads** on it — so writing `CLEAN` by hand
+does not pass. Push a fix and the receipt goes stale, forcing re-review.
+
+When Codex is genuinely unavailable, use `status: OVERRIDE` with `reason:` and
+`approved_by:` — **and** comment `review-gate-override <head_sha>` on the PR from
+an allowlisted account. The receipt's `approved_by` must name that same account.
+
+### Inputs
+
+| Input | Default | Purpose |
+|---|---|---|
+| `sensitive_paths` | `.github/`, `AGENTS/CLAUDE/REVIEW.md`, supabase migrations/functions, auth-ish filenames | Newline-separated EREs. A match puts the PR in the strict lane where **P2 also blocks**. Over-match rather than under-match. |
+| `allowed_approvers` | `crysezel` | Comma-separated logins that may authorize an OVERRIDE. |
+| `policy_doc` | generic text | Cited in error messages. |
+| `codex_bot_login` | `chatgpt-codex-connector` | REST appends `[bot]`, GraphQL does not — matched by prefix. |
+| `codex_required` | `true` | Set `false` only where Codex review is not enabled yet. CLEAN then rests on the receipt alone and proves nothing; the run warns loudly. |
+
+### Severity lanes
+
+| Severity | Routine change | Sensitive change |
+|---|---|---|
+| P0 / P1 | blocks | blocks |
+| P2 | advisory | **blocks** |
+| P3 | advisory | advisory |
+
+Sensitivity is derived from the PR's changed files, never self-declared, so a
+session cannot relabel a migration PR as routine.
+
+### Prerequisites
+
+- **Codex review must be enabled on the repo.** Without it, no `CLEAN` receipt
+  can ever be satisfied and the gate is permanently red. Either enable Codex, or
+  start with `codex_required: false` and tighten later.
+- A `request-codex-review.yml` (or equivalent) that asks Codex to review.
+
+### Known ceiling
+
+In a repo where one account is author, approver and thread-resolver, no check
+that account controls can bind it. This gate makes a bypass **explicit,
+deliberate and auditable — not impossible.** It is a discipline aid, not a
+security boundary. For a real boundary you need a second identity.
 
 ## Versioning
 
